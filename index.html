@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="theme-color" content="#16a34a">
+<title>Puerta Nona</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg">
+<link rel="apple-touch-icon" href="icon.svg">
+<!-- Lector de QR: html5-qrcode 2.3.8 (versión fija, licencia Apache-2.0). Queda guardado en el celular para usar sin señal. -->
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: Arial, sans-serif; margin: 0; padding: 12px; background: #f4f4f5; color: #111; }
+  h1 { font-size: 20px; margin: 4px 0 12px; text-align: center; }
+  .caja { background: #fff; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+  button, input, select { font-size: 18px; width: 100%; padding: 14px; border-radius: 10px; border: 1px solid #ccc; margin-top: 8px; }
+  button { border: none; font-weight: bold; color: #fff; background: #2563eb; }
+  button.gris { background: #6b7280; }
+  button.verde { background: #16a34a; }
+  button.chico { font-size: 14px; padding: 8px; background: none; color: #6b7280; text-decoration: underline; }
+  .oculto { display: none !important; }
+  #barra { border-radius: 10px; padding: 10px; margin-bottom: 12px; font-size: 15px; text-align: center; background: #e5e7eb; }
+  #reader { width: 100%; margin-top: 8px; }
+  #resultado { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+               justify-content: center; padding: 24px; text-align: center; color: #fff; z-index: 10; }
+  #resultado .grande { font-size: 44px; font-weight: bold; margin-bottom: 16px; }
+  #resultado .nombre { font-size: 30px; margin-bottom: 10px; }
+  #resultado .detalle { font-size: 20px; margin-bottom: 30px; }
+  #resultado button { background: rgba(0,0,0,.35); max-width: 400px; }
+  .fila { padding: 10px; border-bottom: 1px solid #eee; font-size: 17px; }
+  #estado { text-align: center; color: #555; min-height: 22px; margin-top: 6px; }
+  .tip { font-size: 14px; color: #444; line-height: 1.4; }
+</style>
+</head>
+<body>
+<h1>🎟️ Puerta – Lo que esperaba la Nona</h1>
+
+<!-- 1) Ingreso con clave (solo la primera vez, con señal) -->
+<div id="login" class="caja oculto">
+  <label>¿Quién escanea?</label>
+  <select id="puerta">
+    <option>Puerta 1</option><option>Puerta 2</option><option>Puerta 3</option>
+  </select>
+  <input id="pin" type="password" inputmode="numeric" placeholder="Clave del equipo">
+  <button onclick="entrar()">Entrar</button>
+  <div id="errLogin" style="color:#b91c1c;margin-top:8px"></div>
+</div>
+
+<!-- 2) Pantalla de trabajo -->
+<div id="app" class="oculto">
+  <div id="barra">…</div>
+  <div class="caja">
+    <button id="btnCam" onclick="toggleCamara()">📷 Encender cámara</button>
+    <div id="reader"></div>
+    <button class="gris" onclick="document.getElementById('foto').click()">🖼️ Plan B: sacar foto del QR</button>
+    <input id="foto" type="file" accept="image/*" capture="environment" class="oculto" onchange="leerFoto(this)">
+    <div id="lectorFoto" class="oculto"></div>
+    <div id="estado"></div>
+  </div>
+  <div class="caja">
+    <label>Buscar por DNI (si no tiene QR)</label>
+    <input id="dni" type="tel" inputmode="numeric" placeholder="DNI sin puntos">
+    <button class="gris" onclick="buscar()">Buscar</button>
+    <div id="resDni"></div>
+  </div>
+  <div class="tip">Funciona <b>sin señal</b>: la lista está guardada en este celular y los ingresos se suben solos cuando vuelve la señal.</div>
+  <div style="text-align:center">
+    <button class="chico" onclick="sincronizar(true)">Actualizar lista ahora</button>
+    <button class="chico" onclick="salir()">Cerrar sesión de este celular</button>
+  </div>
+</div>
+
+<!-- 3) Resultado en grande -->
+<div id="resultado" class="oculto">
+  <div class="grande" id="rTitulo"></div>
+  <div class="nombre" id="rNombre"></div>
+  <div class="detalle" id="rDetalle"></div>
+  <button onclick="cerrarResultado()">Siguiente ▶</button>
+</div>
+
+<script>
+  // Dirección de la hoja (Web App de Apps Script)
+  const API = 'https://script.google.com/macros/s/AKfycbwTt9QlwmhBe2sE4QHsQl_kBdX48wmXxmAkVxy4SHO_o5M_dyfjI6PiOgaOBPuPqw/exec';
+
+  let PIN = '', PUERTA = '', ocupado = false;
+  let LISTA = {};      // código -> {c,n,d,e,u,h,p}
+  let PEND = [];       // ingresos marcados que falta subir a la hoja
+  let HORA_LISTA = '', CONECTADO = false, SINCRONIZANDO = false;
+  let camara = null, camaraActiva = false, ultimo = '', ultimoT = 0;
+
+  function $(id) { return document.getElementById(id); }
+  function estado(t) { $('estado').textContent = t || ''; }
+  function guardar(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  function leer(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
+  function ahora() { const d = new Date(); return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2); }
+  function persistir() { guardar('nona_lista', JSON.stringify(LISTA)); guardar('nona_pend', JSON.stringify(PEND)); guardar('nona_hora', HORA_LISTA); }
+
+  // Guarda la app en el celular para que abra sin señal
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+
+  // Llama a la hoja. Si no hay señal, el error dice "red".
+  async function api(cuerpo, ms) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), ms || 15000);
+    let r;
+    try {
+      r = await fetch(API, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(cuerpo), signal: ctl.signal });
+      r = await r.json();
+    } catch (e) { const x = new Error('Sin señal'); x.red = true; throw x; }
+    finally { clearTimeout(t); }
+    if (!r.ok) throw new Error(r.error);
+    return r.data;
+  }
+
+  // ---- Inicio ----
+  try { LISTA = JSON.parse(leer('nona_lista') || '{}'); PEND = JSON.parse(leer('nona_pend') || '[]'); HORA_LISTA = leer('nona_hora'); } catch (e) {}
+  (function inicio() {
+    PIN = leer('nona_pin'); PUERTA = leer('nona_puerta') || 'Puerta 1';
+    if (PIN) { abrirApp(); sincronizar(false); }
+    else $('login').classList.remove('oculto');
+  })();
+
+  async function entrar() {
+    PIN = $('pin').value.trim(); PUERTA = $('puerta').value;
+    $('errLogin').textContent = 'Verificando…';
+    try {
+      await api({ accion: 'entrar', pin: PIN });
+      guardar('nona_pin', PIN); guardar('nona_puerta', PUERTA);
+      abrirApp(); sincronizar(true);
+    } catch (e) {
+      $('errLogin').textContent = e.red ? 'Para entrar la primera vez hace falta señal.' : e.message;
+    }
+  }
+
+  function abrirApp() { $('login').classList.add('oculto'); $('app').classList.remove('oculto'); barra(); }
+
+  function salir() {
+    if (PEND.length && !confirmarSalida()) return;
+    guardar('nona_pin', ''); location.reload();
+  }
+  function confirmarSalida() { estado('Hay ingresos sin subir: esperá a tener señal antes de cerrar sesión.'); return false; }
+
+  function barra() {
+    const v = Object.values(LISTA);
+    const n = v.filter(x => x.e === 'APROBADO').length, ing = v.filter(x => x.u).length;
+    $('barra').style.background = CONECTADO ? '#dcfce7' : '#fee2e2';
+    $('barra').innerHTML = (CONECTADO ? '🟢 Con señal' : '🔴 Sin señal') + ' · ' + PUERTA +
+      '<br>Lista: ' + n + ' entradas (actualizada ' + (HORA_LISTA || '—') + ') · Ingresaron: ' + ing +
+      (PEND.length ? '<br><b>⏳ ' + PEND.length + ' ingreso(s) sin subir todavía</b>' : '');
+  }
+
+  // ---- Sincronización: sube pendientes y baja la lista (cada 30 s y después de cada ingreso) ----
+  async function sincronizar(forzado) {
+    if (SINCRONIZANDO || !PIN) return;
+    SINCRONIZANDO = true;
+    try {
+      const r = await api({ accion: 'sincronizar', pin: PIN, puerta: PUERTA, marcas: PEND.slice() }, 20000);
+      CONECTADO = true;
+      const ok = new Set(r.recibidas || []);
+      PEND = PEND.filter(p => !ok.has(p.id));
+      const nueva = {};
+      r.lista.forEach(x => { nueva[x.c || ('dni:' + x.d)] = x; });
+      PEND.forEach(p => { // lo marcado acá que todavía no subió sigue marcado
+        const k = p.c || Object.keys(nueva).find(k => nueva[k].d === p.d && nueva[k].e === 'APROBADO');
+        if (k && nueva[k]) { nueva[k].u = true; nueva[k].h = p.hh; nueva[k].p = p.p; }
+      });
+      LISTA = nueva; HORA_LISTA = r.hora; persistir();
+      if (forzado) estado('Lista actualizada.');
+    } catch (e) {
+      if (e.red) { CONECTADO = false; if (forzado) estado('Sin señal: se sigue usando la lista guardada.'); }
+      else if (/clave/i.test(e.message)) { guardar('nona_pin', ''); estado(e.message); }
+      else estado('Error: ' + e.message);
+    }
+    SINCRONIZANDO = false; barra();
+  }
+  setInterval(() => sincronizar(false), 30000);
+  window.addEventListener('online', () => sincronizar(false));
+
+  // ---- Cámara en vivo ----
+  function toggleCamara() {
+    if (camaraActiva) { camara.stop().catch(() => {}); camaraActiva = false; $('btnCam').textContent = '📷 Encender cámara'; estado(''); return; }
+    camara = camara || new Html5Qrcode('reader', { formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE], experimentalFeatures: { useBarCodeDetectorIfSupported: true } });
+    camara.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 250, height: 250 } }, alLeer, () => {})
+      .then(() => { camaraActiva = true; $('btnCam').textContent = '⏹️ Apagar cámara'; estado('Apuntá al QR'); })
+      .catch(e => estado('No se pudo abrir la cámara (' + e + '). Revisá el permiso de cámara o usá el plan B.'));
+  }
+  function alLeer(texto) {
+    if (ocupado) return;
+    if (texto === ultimo && Date.now() - ultimoT < 3000) return; // no leer 2 veces el mismo QR seguido
+    ultimo = texto; ultimoT = Date.now();
+    procesar(texto);
+  }
+
+  // ---- Plan B: foto (se achica para que lea mejor) ----
+  async function leerFoto(input) {
+    const f = input.files[0]; input.value = '';
+    if (!f) return;
+    estado('Leyendo foto…');
+    const img = await new Promise((ok, mal) => { const i = new Image(); i.onload = () => ok(i); i.onerror = mal; i.src = URL.createObjectURL(f); });
+    for (const lado of [1000, 700, 1400]) {
+      const k = Math.min(1, lado / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      const blob = await new Promise(ok => c.toBlob(ok, 'image/jpeg', 0.92));
+      try {
+        const lector = new Html5Qrcode('lectorFoto');
+        const txt = await lector.scanFile(new File([blob], 'qr.jpg', { type: 'image/jpeg' }), false);
+        lector.clear(); procesar(txt); return;
+      } catch (e) {}
+    }
+    estado('No se encontró un QR en la foto. Probá de nuevo, más cerca y sin reflejo.');
+  }
+
+  // ---- Validación en el celular (funciona sin señal) ----
+  function procesar(texto) {
+    const m = String(texto).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    const c = m ? m[0].toLowerCase() : '';
+    const x = c ? LISTA[c] : null;
+    if (!x) return mostrar('NO_EXISTE', '', c ? 'No está en la lista (actualizada ' + HORA_LISTA + ')' : 'El QR no es una entrada de este evento');
+    if (x.e !== 'APROBADO') return mostrar('NO_APROBADA', x.n, 'Estado: ' + (x.e || 'sin revisar'));
+    if (x.u) return mostrar('YA_USADA', x.n, 'Ingresó ' + x.h + ' por ' + x.p);
+    marcar(x, '');
+  }
+
+  function marcar(x, dni) {
+    x.u = true; x.h = ahora(); x.p = PUERTA;
+    PEND.push({ id: Date.now() + '-' + Math.random().toString(36).slice(2, 7), c: x.c || '', d: x.c ? '' : dni, t: Date.now(), p: PUERTA, hh: x.h });
+    persistir(); barra();
+    mostrar('VALIDA', x.n, dni ? 'Ingreso por DNI' : '');
+    sincronizar(false);
+  }
+
+  function mostrar(res, nombre, detalle) {
+    ocupado = true;
+    if (camaraActiva) try { camara.pause(true); } catch (e) {}
+    const t = { VALIDA: ['✅ VÁLIDA', '#16a34a'], YA_USADA: ['⛔ YA USADA', '#dc2626'],
+                NO_EXISTE: ['⛔ NO EXISTE', '#dc2626'], NO_APROBADA: ['⛔ NO APROBADA', '#dc2626'] }[res];
+    $('rTitulo').textContent = t[0];
+    $('resultado').style.background = t[1];
+    $('rNombre').textContent = nombre || '';
+    $('rDetalle').textContent = detalle || '';
+    $('resultado').classList.remove('oculto');
+    if (navigator.vibrate) navigator.vibrate(res === 'VALIDA' ? 150 : [300, 100, 300]);
+    estado('');
+  }
+
+  function cerrarResultado() {
+    $('resultado').classList.add('oculto');
+    ocupado = false; ultimoT = Date.now();
+    if (camaraActiva) try { camara.resume(); } catch (e) {}
+  }
+
+  // ---- Búsqueda por DNI ----
+  function buscar() {
+    const dni = $('dni').value.replace(/\D/g, '');
+    const cont = $('resDni'); cont.innerHTML = '';
+    if (!dni) return;
+    const hall = Object.values(LISTA).filter(x => x.d === dni);
+    if (!hall.length) { cont.textContent = 'No hay ninguna entrada con ese DNI.'; return; }
+    hall.forEach(x => {
+      const d = document.createElement('div'); d.className = 'fila';
+      d.textContent = x.n + ' — ' + (x.e || 'sin revisar') + (x.u ? ' — YA INGRESÓ ' + x.h + ' (' + x.p + ')' : '');
+      if (x.e === 'APROBADO' && !x.u) {
+        const b = document.createElement('button'); b.className = 'verde';
+        b.textContent = 'Dar ingreso (verificá el DNI físico)';
+        b.onclick = () => { cont.innerHTML = ''; $('dni').value = ''; marcar(x, dni); };
+        d.appendChild(b);
+      }
+      cont.appendChild(d);
+    });
+  }
+</script>
+</body>
+</html>
